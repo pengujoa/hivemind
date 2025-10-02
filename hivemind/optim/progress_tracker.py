@@ -35,6 +35,8 @@ class LocalTrainingProgress(BaseModel):
     samples_per_second: confloat(ge=0.0, strict=True)
     time: StrictFloat
     client_mode: StrictBool
+    # cyshin
+    target_batch_size: conint(ge=0, strict=True)
 
 
 class TrainingProgressSchema(BaseModel):
@@ -148,6 +150,8 @@ class ProgressTracker(threading.Thread):
             samples_per_second=self.performance_ema.samples_per_second,
             time=get_dht_time(),
             client_mode=self.client_mode,
+            # cyshin
+            target_batch_size=self.target_batch_size, 
         )
 
     def report_local_progress(self, local_epoch: int, samples_accumulated: int, update_global_samples: bool = True):
