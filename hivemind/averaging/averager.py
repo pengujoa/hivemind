@@ -137,6 +137,7 @@ class DecentralizedAverager(mp.Process, ServicerBase):
         client_mode: Optional[bool] = None,
         daemon: bool = True,
         shutdown_timeout: float = 5,
+        classstr: Optional[str] = None,
     ):
         assert "." not in prefix, "group prefix must be a string without trailing '.'"
         assert bandwidth is None or (
@@ -176,8 +177,12 @@ class DecentralizedAverager(mp.Process, ServicerBase):
         self.schema_hash = compute_schema_hash(self._averaged_tensors)
         self.shutdown_timeout = shutdown_timeout
         self.next_chunk_timeout = next_chunk_timeout
-        self.bandwidth = bandwidth
-
+        self._bandwidth = mp.Value('f', 0.0)  # 'f'는 float 타입
+        if bandwidth is not None:
+            self._bandwidth.value = bandwidth
+        else:
+            self._bandwidth.value = 100.0
+            
         self.matchmaking_kwargs = dict(
             servicer_type=type(self),
             prefix=prefix,
@@ -208,6 +213,7 @@ class DecentralizedAverager(mp.Process, ServicerBase):
         self.declare_state_period = declare_state_period
         self.state_compression = state_compression
         self.tensor_infos = tensor_infos
+        self.classstr = classstr
 
         self._ready = MPFuture()
         # note: we create a background thread weakref and with daemon=True to ensure garbage collection
@@ -219,6 +225,16 @@ class DecentralizedAverager(mp.Process, ServicerBase):
         background_fetcher.start()
         if start:
             self.run_in_background(await_ready=True)
+
+    @property
+    def bandwidth(self) -> float:
+        return self._bandwidth.value if self._bandwidth is not None else 0.0
+    
+    @bandwidth.setter
+    def bandwidth(self, value: float):
+        if self._bandwidth is not None:
+            self._bandwidth.value = value
+
 
     @property
     def allow_state_sharing(self) -> bool:
@@ -373,6 +389,8 @@ class DecentralizedAverager(mp.Process, ServicerBase):
         allow_retries: bool = True,
         require_trigger: bool = False,
         wait: bool = True,
+        # cyshin
+        stridx: Any = "",
     ) -> Union[Optional[Dict[PeerID, GatheredData]], StepControl]:
         """
         Set up the averager to look for a group and run one round of averaging, return True on success, False on failure
@@ -389,6 +407,7 @@ class DecentralizedAverager(mp.Process, ServicerBase):
         :param wait: if True (default), return when finished. Otherwise return StepControl and run in background.
         :returns: on success, update averaged_tensors and return group info; on failure, return None
         """
+        print("######## def step ############", stridx)
         if self.mode == AveragingMode.AUX and weight is not None:
             logger.warning("Averager is running in auxiliary mode, weight is unused")
         if scheduled_time is None:
@@ -401,7 +420,8 @@ class DecentralizedAverager(mp.Process, ServicerBase):
         assert scheduled_time < deadline, "Scheduled start time does not fit within timeout"
 
         user_data_for_gather = self.serializer.dumps(gather)  # serialize here to avoid imports in the averager process
-        data_for_gather = self.serializer.dumps([self.bandwidth, self.mode.value, user_data_for_gather])
+        print("######## self._bandwidth.value ############", self._bandwidth.value)
+        data_for_gather = self.serializer.dumps([self._bandwidth.value, self.mode.value, user_data_for_gather])
         step = StepControl(
             scheduled_time=scheduled_time,
             deadline=deadline,
@@ -411,14 +431,20 @@ class DecentralizedAverager(mp.Process, ServicerBase):
         )
 
         future_for_init = MPFuture()
-        self._outer_pipe.send(("_step", [], dict(step=step, future_for_init=future_for_init)))
+        # cyshin
+        # self._outer_pipe.send(("_step", [], dict(step=step, future_for_init=future_for_init)))
+        self._outer_pipe.send(("_step", [], dict(step=step, future_for_init=future_for_init, stridx=stridx)))
         step.attach(*future_for_init.result())
 
         if not require_trigger:
             step.allow_allreduce()
         return step.result() if wait else step
 
-    async def _step(self, *, step: StepControl, future_for_init: MPFuture):
+    # async def _step(self, *, step: StepControl, future_for_init: MPFuture):
+    async def _step(self, *, step: StepControl, future_for_init: MPFuture, stridx):
+        # cyshin
+        print("######## def _step ############", stridx)
+        print(stridx)
         try:
             trigger, cancel = MPFuture(), MPFuture()
             step.attach(trigger, cancel)
@@ -460,6 +486,7 @@ class DecentralizedAverager(mp.Process, ServicerBase):
                                     tensor_infos=self.tensor_infos,
                                     weight=step.weight,
                                     **self.allreduce_kwargs,
+                                    stridx=stridx,
                                 ),
                                 timeout=self._allreduce_timeout,
                             )
@@ -511,7 +538,7 @@ class DecentralizedAverager(mp.Process, ServicerBase):
                 logger.warning(f"All-reduce group {group_info.group_id} did not finish.")
             self._pending_groups_registered.set()
 
-    async def _aggregate_with_group(self, group_info: GroupInfo, min_vector_size: int, **kwargs) -> GatheredData:
+    async def _aggregate_with_group(self, group_info: GroupInfo, min_vector_size: int, stridx: str, **kwargs) -> GatheredData:
         """Run aggregation in a given group and update tensors in place, return gathered metadata"""
         try:
             bandwidths, mode_ids, user_gathered_bytes = zip(*map(self.serializer.loads, group_info.gathered))
@@ -527,7 +554,7 @@ class DecentralizedAverager(mp.Process, ServicerBase):
             )
 
             async with enter_asynchronously(self.get_tensors()) as local_tensors:
-                await self._run_allreduce_inplace_(local_tensors, group_info, peer_fractions=peer_fractions, **kwargs)
+                await self._run_allreduce_inplace_(local_tensors, group_info, peer_fractions=peer_fractions, stridx=stridx, **kwargs)
                 return user_gathered
         except BaseException as e:
             if isinstance(e, Exception):
@@ -535,8 +562,10 @@ class DecentralizedAverager(mp.Process, ServicerBase):
             raise MatchmakingException(f"Unable to run All-Reduce: {e}")
 
     async def _run_allreduce_inplace_(
-        self, tensors: Sequence[torch.Tensor], group_info: GroupInfo, group_id: Optional[bytes] = None, **kwargs
+        self, tensors: Sequence[torch.Tensor], group_info: GroupInfo, group_id: Optional[bytes] = None, stridx: str = "", **kwargs
     ):
+        # cyshin
+        print("######## def _run_allreduce_inplace_ ############", stridx)
         """Run one allreduce process to average tensors inplace. Can be called more than a few times in one aggregation process"""
         group_id = group_info.group_id if group_id is None else group_id
 
@@ -547,6 +576,7 @@ class DecentralizedAverager(mp.Process, ServicerBase):
             tensors=tensors,
             group_id=group_id,
             ordered_peer_ids=group_info.peer_ids,
+            classstr=self.classstr,
             **kwargs,
         )
         assert group_id in self._running_groups, f"Group id {group_id} was not registered in _register_allreduce_group"
@@ -560,6 +590,13 @@ class DecentralizedAverager(mp.Process, ServicerBase):
         else:
             async for _ in runner:
                 raise ValueError("aux peers should not receive averaged tensors")
+            
+        # if self.classstr=="gradaverager":
+        print(f"p2p.dht.averager throughput: {runner.throughput}")
+        self._bandwidth.value = runner.throughput
+        print(self._bandwidth.value)        
+
+
 
     @contextlib.contextmanager
     def get_tensors(self) -> Sequence[torch.Tensor]:

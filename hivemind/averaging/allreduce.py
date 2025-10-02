@@ -17,11 +17,15 @@ from hivemind.utils.asyncio import (
     as_aiter,
     attach_event_on_finished,
 )
+import time
 
 # flavour types
 GroupID = bytes
 logger = get_logger(__name__)
 
+import logging
+import sys
+logger.setLevel(logging.INFO)
 
 class AveragingMode(Enum):
     NODE = 0
@@ -74,6 +78,8 @@ class AllReduceRunner(ServicerBase):
         modes: Optional[Sequence[AveragingMode]] = None,
         sender_timeout: Optional[float] = None,
         reducer_timeout: Optional[float] = None,
+        classstr: Optional[str] = None,
+        throughput: Optional[float] = None,
         **kwargs,
     ):
         self._p2p = p2p
@@ -128,6 +134,8 @@ class AllReduceRunner(ServicerBase):
             tuple(part.shape for part in self.parts_for_local_averaging),
             len(self.sender_peer_ids),
         )
+        self.classstr = classstr
+        self.throughput = throughput
 
     def __repr__(self):
         return f"{self.__class__.__name__}({self.peer_id}, group_size={self.group_size})"
@@ -200,29 +208,66 @@ class AllReduceRunner(ServicerBase):
 
     async def _communicate_with_peer(self, peer_id: PeerID):
         """Send a part of local tensors and metadata to a single peer, receive the average for that part of tensors"""
-        peer_index = self.ordered_peer_ids.index(peer_id)
+        peer_index = self.ordered_peer_ids.index(peer_id)  # 이게 peer의 rank
+        my_rank = self.ordered_peer_ids.index(self.peer_id)  # 현재 노드의 rank
+        
+        
         if peer_id == self.peer_id:
+            # if self.classstr=="gradaverager":
+            print(f"[Node Rank {my_rank}] Processing local tensors")
+            
             sender_index = self.sender_peer_ids.index(peer_id)
+            
             for part_index, tensor_part in enumerate(self.parts_for_local_averaging):
                 averaged_part = await self.tensor_part_reducer.accumulate_part(
                     sender_index, part_index, tensor_part, weight=self.weight
-                )
+                )    
+                if part_index == 0:
+                    t_start = time.monotonic()            
                 self.tensor_part_container.register_processed_part(peer_index, part_index, averaged_part - tensor_part)
+                
+                    
+            # if self.classstr=="gradaverager":
+            t_end = time.monotonic()
+            print(f"[Node Rank {my_rank}] Local processing time: {t_end - t_start:.3f}s")
+            print(f"[Node Rank {my_rank}] Local processing parts: {self.tensor_part_container.num_parts_by_peer[my_rank]:.3f}s")
+            self.throughput = self.tensor_part_container.num_parts_by_peer[my_rank]/(t_end - t_start)
 
         else:
             try:
+                # 통신 시작 시 상세 정보 로그
+                if self.classstr=="gradaverager":
+                    print(f"[Node Rank {my_rank}] Starting communication with Node Rank {peer_index}")
+                    print(f"  - Peer fraction: {self.peer_fractions[my_rank]}")  # 이 노드가 처리하는 데이터 비율
+                    print(f"  - Target peer fraction: {self.peer_fractions[peer_index]}")
+                    print(f"  - Number of parts to process: {self.tensor_part_container.num_parts_by_peer[peer_index]}")
+
+                    t_start = time.monotonic()
+                
+                    # 입력 데이터 직렬화 시작
+                    t_serialize_start = time.monotonic()                
                 done_sending = asyncio.Event()
                 inputs_aiter = attach_event_on_finished(self._generate_input_for_peer(peer_index), done_sending)
+                if self.classstr=="gradaverager":
+                    t_serialize_end = time.monotonic()
+                    
+                    # 실제 통신 시작
+                    t_comm_start = time.monotonic()
                 stream = await self._get_peer_stub(peer_id).rpc_aggregate_part(inputs_aiter)
 
                 if self.should_delay_results(self.peer_id):
                     await done_sending.wait()
 
+                # 데이터 수신 및 역직렬화
+                if self.classstr=="gradaverager":
+                    print(f"[Node Rank {my_rank}] Receiving averaged tensors from Node Rank {peer_index}")
+                    t_deserialize_start = time.monotonic()      
+
                 part_index = 0
 
                 def _try_deserialize(msg):
                     if msg.code != averaging_pb2.AVERAGED_PART:
-                        raise AllreduceException(f"{peer_id} sent {averaging_pb2.MessageCode.Name(msg.code)}")
+                        raise AllreduceException(f"Node Rank {peer_index} sent {averaging_pb2.MessageCode.Name(msg.code)}")
                     return deserialize_torch_tensor(msg.tensor_part), msg
 
                 async for delta, msg in amap_in_executor(
@@ -232,15 +277,38 @@ class AllReduceRunner(ServicerBase):
                 ):
                     self.tensor_part_container.register_processed_part(peer_index, part_index, delta)
                     part_index += 1
+                    
+                    # 진행 상황 로그
+                    if self.classstr=="gradaverager":
+                        if part_index % 10 == 0:
+                            print(
+                                f"[Node Rank {my_rank}] Progress with Node Rank {peer_index}: "
+                                f"{part_index}/{self.tensor_part_container.num_parts_by_peer[peer_index]} parts"
+                            )
 
+                # 통신 완료 통계
+                if self.classstr=="gradaverager":
+                    t_end = time.monotonic()
+                
+                # 시간 측정 결과 출력
+                    print(f"[Node Rank {my_rank}] Communication with Node Rank {peer_index} completed:")
+                    print(f"  - Serialization time: {t_serialize_end - t_serialize_start:.3f}s")
+                    print(f"  - Pure communication time: {t_deserialize_start - t_comm_start:.3f}s")
+                    print(f"  - Deserialization time: {t_end - t_deserialize_start:.3f}s")
+                    print(f"  - Total time: {t_end - t_deserialize_start:.3f}s")
+                
                 if part_index != self.tensor_part_container.num_parts_by_peer[peer_index]:
                     raise AllreduceException(
-                        f"peer {peer_id} sent {part_index} parts, but we expected "
+                        f"Node Rank {peer_index} sent {part_index} parts, but expected "
                         f"{self.tensor_part_container.num_parts_by_peer[peer_index]}"
                     )
             except BaseException as e:
+                logger.error(
+                    f"[Node Rank {my_rank}] Error in communication with Node Rank {peer_index}: {str(e)}"
+                )
+                
                 if isinstance(e, Exception):
-                    logger.debug(f"Caught {repr(e)} when communicating to {peer_id}", exc_info=True)
+                    logger.debug(f"Caught {repr(e)} when communicating with Node Rank {peer_index}", exc_info=True)
                 self.tensor_part_container.register_failed_reducer(peer_index)
                 raise
 
