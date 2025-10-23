@@ -281,10 +281,11 @@ class AllReduceRunner(ServicerBase):
                     # 진행 상황 로그
                     if self.classstr=="gradaverager":
                         if part_index % 10 == 0:
-                            print(
-                                f"[Node Rank {my_rank}] Progress with Node Rank {peer_index}: "
-                                f"{part_index}/{self.tensor_part_container.num_parts_by_peer[peer_index]} parts"
-                            )
+                            pass
+                            # print(
+                            #     f"[Node Rank {my_rank}] Progress with Node Rank {peer_index}: "
+                            #     f"{part_index}/{self.tensor_part_container.num_parts_by_peer[peer_index]} parts"
+                            # )
 
                 # 통신 완료 통계
                 if self.classstr=="gradaverager":
