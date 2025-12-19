@@ -407,7 +407,7 @@ class DecentralizedAverager(mp.Process, ServicerBase):
         :param wait: if True (default), return when finished. Otherwise return StepControl and run in background.
         :returns: on success, update averaged_tensors and return group info; on failure, return None
         """
-        print("######## def step ############", stridx)
+        # print("######## def step ############", stridx)
         if self.mode == AveragingMode.AUX and weight is not None:
             logger.warning("Averager is running in auxiliary mode, weight is unused")
         if scheduled_time is None:
@@ -420,7 +420,7 @@ class DecentralizedAverager(mp.Process, ServicerBase):
         assert scheduled_time < deadline, "Scheduled start time does not fit within timeout"
 
         user_data_for_gather = self.serializer.dumps(gather)  # serialize here to avoid imports in the averager process
-        print("######## self._bandwidth.value ############", self._bandwidth.value)
+        print("self._bandwidth.value", self._bandwidth.value)
         data_for_gather = self.serializer.dumps([self._bandwidth.value, self.mode.value, user_data_for_gather])
         step = StepControl(
             scheduled_time=scheduled_time,
@@ -443,8 +443,8 @@ class DecentralizedAverager(mp.Process, ServicerBase):
     # async def _step(self, *, step: StepControl, future_for_init: MPFuture):
     async def _step(self, *, step: StepControl, future_for_init: MPFuture, stridx):
         # cyshin
-        print("######## def _step ############", stridx)
-        print(stridx)
+        # print("######## def _step ############", stridx)
+        # print(stridx)
         try:
             trigger, cancel = MPFuture(), MPFuture()
             step.attach(trigger, cancel)
@@ -565,7 +565,7 @@ class DecentralizedAverager(mp.Process, ServicerBase):
         self, tensors: Sequence[torch.Tensor], group_info: GroupInfo, group_id: Optional[bytes] = None, stridx: str = "", **kwargs
     ):
         # cyshin
-        print("######## def _run_allreduce_inplace_ ############", stridx)
+        # print("######## def _run_allreduce_inplace_ ############", stridx)
         """Run one allreduce process to average tensors inplace. Can be called more than a few times in one aggregation process"""
         group_id = group_info.group_id if group_id is None else group_id
 
@@ -592,10 +592,8 @@ class DecentralizedAverager(mp.Process, ServicerBase):
                 raise ValueError("aux peers should not receive averaged tensors")
             
         # if self.classstr=="gradaverager":
-        print(f"p2p.dht.averager throughput: {runner.throughput}")
+        print(f"p2p.dht.averager throughput value: {runner.throughput}")
         self._bandwidth.value = runner.throughput
-        print(self._bandwidth.value)        
-
 
 
     @contextlib.contextmanager
