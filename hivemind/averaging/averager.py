@@ -540,6 +540,7 @@ class DecentralizedAverager(mp.Process, ServicerBase):
 
     async def _aggregate_with_group(self, group_info: GroupInfo, min_vector_size: int, stridx: str, **kwargs) -> GatheredData:
         """Run aggregation in a given group and update tensors in place, return gathered metadata"""
+        time_0_allreduce_networking = time.perf_counter()
         try:
             bandwidths, mode_ids, user_gathered_bytes = zip(*map(self.serializer.loads, group_info.gathered))
             user_gathered = dict(zip(group_info.peer_ids, map(self.serializer.loads, user_gathered_bytes)))
@@ -549,6 +550,7 @@ class DecentralizedAverager(mp.Process, ServicerBase):
             download_bandwidths = [
                 thr if mode != AveragingMode.CLIENT else 0.0 for thr, mode in zip(bandwidths, modes)
             ]
+            
             peer_fractions = await asyncio.get_event_loop().run_in_executor(
                 None, load_balance_peers, self.total_size, download_bandwidths, min_vector_size
             )
@@ -564,8 +566,6 @@ class DecentralizedAverager(mp.Process, ServicerBase):
     async def _run_allreduce_inplace_(
         self, tensors: Sequence[torch.Tensor], group_info: GroupInfo, group_id: Optional[bytes] = None, stridx: str = "", **kwargs
     ):
-        # cyshin
-        # print("######## def _run_allreduce_inplace_ ############", stridx)
         """Run one allreduce process to average tensors inplace. Can be called more than a few times in one aggregation process"""
         group_id = group_info.group_id if group_id is None else group_id
 
@@ -799,6 +799,12 @@ class DecentralizedAverager(mp.Process, ServicerBase):
         except Exception as e:
             if not future.done():
                 future.set_exception(e)
+    
+    async def _update_averaged_tensors(self):
+        """averager 프로세스에서 _averaged_tensors를 업데이트합니다 (DiLoCoGradAverager에서 사용)"""
+        # DiLoCoGradAverager가 이 메서드를 오버라이드하여 구현합니다
+        # 기본 구현은 아무것도 하지 않습니다
+        pass
 
 
 def _background_thread_fetch_current_state(

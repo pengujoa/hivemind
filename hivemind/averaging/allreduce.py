@@ -82,6 +82,8 @@ class AllReduceRunner(ServicerBase):
         throughput: Optional[float] = None,
         **kwargs,
     ):
+        self.classstr = classstr
+        self.throughput = throughput
         self._p2p = p2p
         self.peer_id = p2p.peer_id
         assert self.peer_id in ordered_peer_ids, "peer_id is not a part of the group"
@@ -134,8 +136,6 @@ class AllReduceRunner(ServicerBase):
             tuple(part.shape for part in self.parts_for_local_averaging),
             len(self.sender_peer_ids),
         )
-        self.classstr = classstr
-        self.throughput = throughput
 
     def __repr__(self):
         return f"{self.__class__.__name__}({self.peer_id}, group_size={self.group_size})"
