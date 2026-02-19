@@ -72,6 +72,8 @@ class DecentralizedAverager(mp.Process, ServicerBase):
     :param bandwidth: if specified, this value represents the network bandwidth available to averager.
           By default, the averager is assumed to have the average bandwidth of his group.
           If bandwidth == 0, averager will rely on its groupmates to do all the averaging.
+    :param use_throughput_adaptive_sizing: if True (default), use throughput from previous rounds to adaptively
+          adjust tensor partitioning. If False, use uniform partitioning regardless of measured throughput.
     :param client_mode: if False, this averager will accept incoming requests from other peers.
           if True, the averager will only join existing groups where at least one peer has client_mode=False.
           By default, this flag is copied from DHTNode inside the ``dht`` instance.
@@ -130,6 +132,7 @@ class DecentralizedAverager(mp.Process, ServicerBase):
         state_compression: CompressionBase = NoCompression(),
         tensor_infos: Optional[Sequence[CompressionInfo]] = None,
         bandwidth: Optional[float] = None,
+        use_throughput_adaptive_sizing: bool = True,
         min_vector_size: int = 0,
         auxiliary: bool = False,
         allow_state_sharing: Optional[bool] = None,
@@ -177,6 +180,7 @@ class DecentralizedAverager(mp.Process, ServicerBase):
         self.schema_hash = compute_schema_hash(self._averaged_tensors)
         self.shutdown_timeout = shutdown_timeout
         self.next_chunk_timeout = next_chunk_timeout
+        self.use_throughput_adaptive_sizing = use_throughput_adaptive_sizing
         self._bandwidth = mp.Value('f', 0.0)  # 'f'는 float 타입
         if bandwidth is not None:
             self._bandwidth.value = bandwidth
@@ -547,9 +551,17 @@ class DecentralizedAverager(mp.Process, ServicerBase):
             modes = tuple(map(AveragingMode, mode_ids))
 
             # compute optimal part sizes from peer bandwidths; TODO: replace with proper load balancing
-            download_bandwidths = [
-                thr if mode != AveragingMode.CLIENT else 0.0 for thr, mode in zip(bandwidths, modes)
-            ]
+            if self.use_throughput_adaptive_sizing:
+                download_bandwidths = [
+                    thr if mode != AveragingMode.CLIENT else 0.0 for thr, mode in zip(bandwidths, modes)
+                ]
+            else:
+                # Use uniform partitioning when throughput adaptive sizing is disabled
+                # Assign equal bandwidth to all non-client peers so load_balance_peers will partition evenly
+                uniform_bandwidth = 1.0  # Use same bandwidth for all peers to get uniform partitioning
+                download_bandwidths = [
+                    uniform_bandwidth if mode != AveragingMode.CLIENT else 0.0 for mode in modes
+                ]
             
             peer_fractions = await asyncio.get_event_loop().run_in_executor(
                 None, load_balance_peers, self.total_size, download_bandwidths, min_vector_size
@@ -591,9 +603,11 @@ class DecentralizedAverager(mp.Process, ServicerBase):
             async for _ in runner:
                 raise ValueError("aux peers should not receive averaged tensors")
             
-        # if self.classstr=="gradaverager":
-        print(f"p2p.dht.averager throughput value: {runner.throughput}")
-        self._bandwidth.value = runner.throughput
+        # Update bandwidth based on throughput if adaptive sizing is enabled
+        if self.use_throughput_adaptive_sizing:
+            # if self.classstr=="gradaverager":
+            print(f"p2p.dht.averager throughput value: {runner.throughput}")
+            self._bandwidth.value = runner.throughput
 
 
     @contextlib.contextmanager
