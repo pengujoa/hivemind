@@ -238,6 +238,7 @@ class TensorPartReducer:
         current_part_future = self.current_part_future
 
         if part_index < self.sender_failed_after[sender_index]:
+            # Weight를 곱해서 accumulator에 누적
             self.accumulator.add_(tensor_part, alpha=weight)
             self.current_part_accumulated_from += 1
             self.denominator += weight

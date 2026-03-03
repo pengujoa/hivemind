@@ -7,6 +7,7 @@ import torch
 from hivemind.compression.base import CompressionBase, CompressionInfo, NoCompression
 from hivemind.compression.floating import Float16Compression, ScaledFloat16Compression
 from hivemind.compression.quantization import BlockwiseQuantization, Quantile8BitQuantization, Uniform8BitQuantization
+from hivemind.compression.sign_compression import SignBitCompression
 from hivemind.proto import runtime_pb2
 from hivemind.utils.streaming import combine_from_streaming
 
@@ -17,6 +18,7 @@ _BASE_COMPRESSION_TYPES: Dict[str, CompressionBase] = dict(
     QUANTILE_8BIT=Quantile8BitQuantization(),
     UNIFORM_8BIT=Uniform8BitQuantization(),
     BLOCKWISE_8BIT=BlockwiseQuantization(),
+    SIGN_1BIT=SignBitCompression(),
 )
 
 for key in runtime_pb2.CompressionType.keys():

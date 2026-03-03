@@ -21,7 +21,7 @@ import torch
 from hivemind.averaging.allreduce import AllreduceException, AllReduceRunner, AveragingMode, GroupID
 from hivemind.averaging.control import AveragingStage, StepControl
 from hivemind.averaging.group_info import GroupInfo
-from hivemind.averaging.load_balancing import load_balance_peers
+from hivemind.averaging.load_balancing import load_balance_peers, optimize_parts_lp_hybrid, hagenbach_bishoff
 from hivemind.averaging.matchmaking import Matchmaking, MatchmakingException
 from hivemind.averaging.partition import DEFAULT_PART_SIZE_BYTES
 from hivemind.compression import CompressionBase, CompressionInfo, NoCompression, deserialize_torch_tensor
@@ -133,6 +133,7 @@ class DecentralizedAverager(mp.Process, ServicerBase):
         tensor_infos: Optional[Sequence[CompressionInfo]] = None,
         bandwidth: Optional[float] = None,
         use_throughput_adaptive_sizing: bool = True,
+        throughput_ema_alpha: float = 0.5,
         min_vector_size: int = 0,
         auxiliary: bool = False,
         allow_state_sharing: Optional[bool] = None,
@@ -141,6 +142,7 @@ class DecentralizedAverager(mp.Process, ServicerBase):
         daemon: bool = True,
         shutdown_timeout: float = 5,
         classstr: Optional[str] = None,
+        return_deltas: bool = True,
     ):
         assert "." not in prefix, "group prefix must be a string without trailing '.'"
         assert bandwidth is None or (
@@ -181,11 +183,18 @@ class DecentralizedAverager(mp.Process, ServicerBase):
         self.shutdown_timeout = shutdown_timeout
         self.next_chunk_timeout = next_chunk_timeout
         self.use_throughput_adaptive_sizing = use_throughput_adaptive_sizing
-        self._bandwidth = mp.Value('f', 0.0)  # 'f'는 float 타입
+        self._throughput_ema_alpha = throughput_ema_alpha
+        self._has_measured = mp.Value('b', False)
+        self._bandwidth = mp.Value('f', 0.0)
         if bandwidth is not None:
             self._bandwidth.value = bandwidth
         else:
             self._bandwidth.value = 100.0
+
+        self._mp_manager = mp.Manager()
+        self._pairwise_throughputs = self._mp_manager.dict()
+        self._pairwise_times = self._mp_manager.dict()
+        self._pairwise_has_measured = mp.Value('b', False)
             
         self.matchmaking_kwargs = dict(
             servicer_type=type(self),
@@ -202,6 +211,7 @@ class DecentralizedAverager(mp.Process, ServicerBase):
             min_vector_size=min_vector_size,
             sender_timeout=sender_timeout,
             reducer_timeout=reducer_timeout,
+            return_deltas=return_deltas,
         )
         self._averaging_alpha, self._allreduce_timeout = averaging_alpha, allreduce_timeout
         self._running_groups: Dict[GroupID, asyncio.Future[AllReduceRunner]] = {}
@@ -423,9 +433,19 @@ class DecentralizedAverager(mp.Process, ServicerBase):
         assert not (wait and require_trigger), "Non-asynchronous step cannot wait for trigger (use wait=False)"
         assert scheduled_time < deadline, "Scheduled start time does not fit within timeout"
 
-        user_data_for_gather = self.serializer.dumps(gather)  # serialize here to avoid imports in the averager process
-        print("self._bandwidth.value", self._bandwidth.value)
-        data_for_gather = self.serializer.dumps([self._bandwidth.value, self.mode.value, user_data_for_gather])
+        user_data_for_gather = self.serializer.dumps(gather)
+        pairwise_dict = (
+            {str(k): v for k, v in self._pairwise_throughputs.items()}
+            if self._pairwise_has_measured.value else {}
+        )
+        pairwise_times_dict = (
+            {str(k): v for k, v in self._pairwise_times.items()}
+            if self._pairwise_has_measured.value else {}
+        )
+        data_for_gather = self.serializer.dumps([
+            self._bandwidth.value, self.mode.value, user_data_for_gather,
+            pairwise_dict, pairwise_times_dict
+        ])
         step = StepControl(
             scheduled_time=scheduled_time,
             deadline=deadline,
@@ -546,26 +566,41 @@ class DecentralizedAverager(mp.Process, ServicerBase):
         """Run aggregation in a given group and update tensors in place, return gathered metadata"""
         time_0_allreduce_networking = time.perf_counter()
         try:
-            bandwidths, mode_ids, user_gathered_bytes = zip(*map(self.serializer.loads, group_info.gathered))
+            gathered_items = list(map(self.serializer.loads, group_info.gathered))
+            bandwidths = [item[0] for item in gathered_items]
+            mode_ids = [item[1] for item in gathered_items]
+            user_gathered_bytes = [item[2] for item in gathered_items]
+            pairwise_dicts = [item[3] if len(item) > 3 else {} for item in gathered_items]
+            pairwise_times_dicts = [item[4] if len(item) > 4 else {} for item in gathered_items]
+
             user_gathered = dict(zip(group_info.peer_ids, map(self.serializer.loads, user_gathered_bytes)))
             modes = tuple(map(AveragingMode, mode_ids))
 
-            # compute optimal part sizes from peer bandwidths; TODO: replace with proper load balancing
-            if self.use_throughput_adaptive_sizing:
+            use_pairwise_lp = (
+                self.use_throughput_adaptive_sizing
+                and any(len(d) > 0 for d in pairwise_dicts)
+            )
+
+            if use_pairwise_lp:
+                peer_fractions = await self._compute_pairwise_fractions(
+                    group_info, pairwise_dicts, pairwise_times_dicts, modes, min_vector_size
+                )
+            elif self.use_throughput_adaptive_sizing:
                 download_bandwidths = [
-                    thr if mode != AveragingMode.CLIENT else 0.0 for thr, mode in zip(bandwidths, modes)
+                    thr if mode != AveragingMode.CLIENT else 0.0
+                    for thr, mode in zip(bandwidths, modes)
                 ]
+                peer_fractions = await asyncio.get_event_loop().run_in_executor(
+                    None, load_balance_peers, self.total_size, download_bandwidths, min_vector_size
+                )
             else:
-                # Use uniform partitioning when throughput adaptive sizing is disabled
-                # Assign equal bandwidth to all non-client peers so load_balance_peers will partition evenly
-                uniform_bandwidth = 1.0  # Use same bandwidth for all peers to get uniform partitioning
+                uniform_bandwidth = 1.0
                 download_bandwidths = [
                     uniform_bandwidth if mode != AveragingMode.CLIENT else 0.0 for mode in modes
                 ]
-            
-            peer_fractions = await asyncio.get_event_loop().run_in_executor(
-                None, load_balance_peers, self.total_size, download_bandwidths, min_vector_size
-            )
+                peer_fractions = await asyncio.get_event_loop().run_in_executor(
+                    None, load_balance_peers, self.total_size, download_bandwidths, min_vector_size
+                )
 
             async with enter_asynchronously(self.get_tensors()) as local_tensors:
                 await self._run_allreduce_inplace_(local_tensors, group_info, peer_fractions=peer_fractions, stridx=stridx, **kwargs)
@@ -574,6 +609,52 @@ class DecentralizedAverager(mp.Process, ServicerBase):
             if isinstance(e, Exception):
                 logger.exception(e)
             raise MatchmakingException(f"Unable to run All-Reduce: {e}")
+
+    async def _compute_pairwise_fractions(
+        self, group_info: GroupInfo, pairwise_dicts, pairwise_times_dicts, modes, min_vector_size: int
+    ):
+        """Build eff matrix from gathered pairwise throughputs and solve LP."""
+        import numpy as np
+        N = len(group_info.peer_ids)
+        eff_matrix = np.zeros((N, N), dtype=np.float64)
+        time_matrix = np.zeros((N, N), dtype=np.float64)
+
+        for i, peer_i in enumerate(group_info.peer_ids):
+            pw_dict = pairwise_dicts[i]
+            pt_dict = pairwise_times_dicts[i] if i < len(pairwise_times_dicts) else {}
+            for j, peer_j in enumerate(group_info.peer_ids):
+                if i == j:
+                    continue
+                peer_j_str = str(peer_j)
+                if peer_j_str in pw_dict:
+                    eff_matrix[i, j] = pw_dict[peer_j_str]
+                elif peer_j in pw_dict:
+                    eff_matrix[i, j] = pw_dict[peer_j]
+
+                if peer_j_str in pt_dict:
+                    time_matrix[i, j] = pt_dict[peer_j_str]
+                elif peer_j in pt_dict:
+                    time_matrix[i, j] = pt_dict[peer_j]
+
+        has_all = np.all(eff_matrix[np.eye(N) == 0] > 0)
+        if not has_all:
+            nonzero_vals = eff_matrix[eff_matrix > 0]
+            default_eff = float(np.mean(nonzero_vals)) if len(nonzero_vals) > 0 else 1.0
+            for i in range(N):
+                for j in range(N):
+                    if i != j and eff_matrix[i, j] <= 0:
+                        eff_matrix[i, j] = default_eff
+
+        print(f"[Pairwise LP] eff_matrix (frac/s):\n{eff_matrix}")
+        print(f"[Pairwise LP] time_matrix (s):\n{time_matrix}")
+
+        scores = await asyncio.get_event_loop().run_in_executor(
+            None, optimize_parts_lp_hybrid, self.total_size, eff_matrix, min_vector_size
+        )
+
+        peer_fractions = tuple(hagenbach_bishoff(self.total_size, scores))
+        print(f"[Pairwise LP] peer_fractions: {peer_fractions}")
+        return peer_fractions
 
     async def _run_allreduce_inplace_(
         self, tensors: Sequence[torch.Tensor], group_info: GroupInfo, group_id: Optional[bytes] = None, stridx: str = "", **kwargs
@@ -596,18 +677,42 @@ class DecentralizedAverager(mp.Process, ServicerBase):
 
         if runner.modes[group_info.peer_ids.index(self.peer_id)] != AveragingMode.AUX:
             async for tensor, update in azip(as_aiter(*tensors), runner):
-                tensor.add_(update, alpha=self._averaging_alpha)
+                if runner.return_deltas:
+                    tensor.add_(update, alpha=self._averaging_alpha)
+                else:
+                    tensor.copy_(update)
                 self.last_updated = get_dht_time()
                 self._state_updated.set()
         else:
             async for _ in runner:
                 raise ValueError("aux peers should not receive averaged tensors")
             
-        # Update bandwidth based on throughput if adaptive sizing is enabled
         if self.use_throughput_adaptive_sizing:
-            # if self.classstr=="gradaverager":
-            print(f"p2p.dht.averager throughput value: {runner.throughput}")
-            self._bandwidth.value = runner.throughput
+            if not self._has_measured.value:
+                self._bandwidth.value = runner.throughput
+                self._has_measured.value = True
+            else:
+                alpha = self._throughput_ema_alpha
+                self._bandwidth.value = alpha * runner.throughput + (1 - alpha) * self._bandwidth.value
+            print(f"p2p.dht.averager throughput EMA: {self._bandwidth.value:.4f} (raw: {runner.throughput:.4f}, alpha: {self._throughput_ema_alpha})")
+
+            if runner.peer_throughputs:
+                alpha = self._throughput_ema_alpha
+                if not self._pairwise_has_measured.value:
+                    for pid, eff in runner.peer_throughputs.items():
+                        self._pairwise_throughputs[pid] = eff
+                    for pid, t in runner.peer_times.items():
+                        self._pairwise_times[pid] = t
+                    self._pairwise_has_measured.value = True
+                else:
+                    for pid, eff in runner.peer_throughputs.items():
+                        old = self._pairwise_throughputs.get(pid, eff)
+                        self._pairwise_throughputs[pid] = alpha * eff + (1 - alpha) * old
+                    for pid, t in runner.peer_times.items():
+                        old_t = self._pairwise_times.get(pid, t)
+                        self._pairwise_times[pid] = alpha * t + (1 - alpha) * old_t
+                print(f"p2p.dht.averager pairwise eff(frac/s): {dict(self._pairwise_throughputs)}")
+                print(f"p2p.dht.averager pairwise times(s): {dict(self._pairwise_times)}")
 
 
     @contextlib.contextmanager

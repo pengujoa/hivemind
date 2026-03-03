@@ -27,6 +27,7 @@ enum CompressionType{
   QUANTILE_8BIT = 3;
   UNIFORM_8BIT = 4;
   BLOCKWISE_8BIT = 5;
+  SIGN_1BIT = 6;
 }
 
 message Tensor {

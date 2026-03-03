@@ -208,6 +208,90 @@ def optimize_parts_lp_with_max_link(
     return w
 
 
+def optimize_parts_lp_hybrid(
+    vector_size: int,
+    eff_matrix: np.ndarray,
+    min_size: int = 0,
+) -> np.ndarray:
+    """
+    Optimize tensor partitioning using per-link fraction-based effective throughput.
+
+    eff[i][j] = w_j_observed / time_observed[i][j]  (fraction per second)
+
+    The LP predicts completion time as:
+        time_new[i][j] = w_j_new / eff[i][j] = time_obs[i][j] * (w_j_new / w_j_old)
+    This directly uses observed completion times as the baseline, making the
+    optimization robust to fixed overhead costs in the communication pipeline.
+
+    Node i's completion time is bottlenecked by the slowest link:
+        tau_i = max_{j!=i} { w_j / eff[i][j] }
+    We minimize the overall all-reduce time: min max_i { tau_i }.
+
+    :param vector_size: total number of elements (used only for min_size filtering)
+    :param eff_matrix: N x N matrix where eff_matrix[i][j] is the fraction-based
+        effective throughput (frac/sec). Asymmetric. Diagonal is ignored.
+    :param min_size: peers assigned fewer than this many elements get nothing
+    :returns: scores vector (fractions), to be passed to hagenbach_bishoff
+    """
+    N = eff_matrix.shape[0]
+    assert eff_matrix.shape == (N, N), f"Expected square matrix, got {eff_matrix.shape}"
+    V = float(vector_size)
+
+    num_vars = N + 1 + N
+
+    c = np.zeros(num_vars, dtype=np.float64)
+    c[N] = 1.0
+
+    A_eq = np.zeros((1, num_vars), dtype=np.float64)
+    A_eq[0, :N] = 1.0
+    b_eq = np.array([1.0], dtype=np.float64)
+
+    rows_ub, rhs_ub = [], []
+
+    for i in range(N):
+        row = np.zeros(num_vars, dtype=np.float64)
+        row[i] = -1.0
+        rows_ub.append(row)
+        rhs_ub.append(0.0)
+
+    # w_j / eff[i][j] <= tau_i  for all i, j!=i
+    for i in range(N):
+        for j in range(N):
+            if i == j:
+                continue
+            e = eff_matrix[i, j]
+            if e <= 0:
+                e = 1e-10
+            row = np.zeros(num_vars, dtype=np.float64)
+            row[j] = 1.0 / e          # w_j / eff[i][j]
+            row[N + 1 + i] = -1.0     # -tau_i
+            rows_ub.append(row)
+            rhs_ub.append(0.0)
+
+    for i in range(N):
+        row = np.zeros(num_vars, dtype=np.float64)
+        row[N + 1 + i] = 1.0
+        row[N] = -1.0
+        rows_ub.append(row)
+        rhs_ub.append(0.0)
+
+    A_ub = np.array(rows_ub, dtype=np.float64)
+    b_ub = np.array(rhs_ub, dtype=np.float64)
+
+    sol = scipy.optimize.linprog(c, A_ub=A_ub, b_ub=b_ub, A_eq=A_eq, b_eq=b_eq, method="highs")
+    if sol.success:
+        w = sol.x[:N]
+        w = np.maximum(w, 0.0)
+        if V > 0 and np.max(w) >= min_size / V:
+            w[w < min_size / V] = 0.0
+        w = np.round(w, LOAD_BALANCING_LP_DECIMALS)
+        logger.info(f"LP hybrid solved: w={w}, xi(predicted_max_time)={sol.x[N]:.6f}s")
+        return w
+    else:
+        logger.error(f"LP hybrid failed: {sol.message}. Falling back to uniform.")
+        return np.ones(N, dtype=np.float64)
+
+
 def hagenbach_bishoff(vector_size: int, scores: Sequence[float]) -> Sequence[int]:
     """
     Split a vector between participants based on continuous fractions.
