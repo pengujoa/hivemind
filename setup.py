@@ -9,7 +9,11 @@ import tarfile
 import tempfile
 import urllib.request
 
-from pkg_resources import parse_requirements, parse_version
+from packaging.version import Version as parse_version
+
+def parse_requirements(f):
+    return [line.strip() for line in f if line.strip() and not line.startswith("#")]
+
 from setuptools import find_packages, setup
 from setuptools.command.build_py import build_py
 from setuptools.command.develop import develop
